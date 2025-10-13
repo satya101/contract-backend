@@ -30,12 +30,12 @@ async def upload_contract(file: UploadFile = File(...)):
         return {"error": "Unsupported file type"}
 
     # Send to GPT for summarization
-response = client.chat.completions.create(
-    model="gpt-4",
-    messages=[
-        {"role": "system", "content": "Extract parties, clauses, dates, and terms from this contract."},
-        {"role": "user", "content": text[:12000]}
-    ]
-)
-summary = response.choices[0].message.content
+    response = client.chat.completions.create(
+        model="gpt-4",
+        messages=[
+            {"role": "system", "content": "Extract parties, clauses, dates, and terms   from this contract."},
+            {"role": "user", "content": text[:12000]}
+        ]
+    )
+    summary = response.choices[0].message.content
     return {"summary": summary}
