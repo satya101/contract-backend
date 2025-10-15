@@ -61,22 +61,41 @@ async def upload_contract(file: UploadFile = File(...)):
         if not content.strip():
             raise HTTPException(status_code=400, detail="No text extracted from file")
 
-        # Request summary from OpenAI
-        response = client.chat.completions.create(
-            model="gpt-4-turbo",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a contract lawyer assistant. Extract important details from the provided contract, including parties, title info, mortgages, zoning, rates, insurance, notices, and any missing documents."
-                },
-                {
-                    "role": "user",
-                    "content": content[:12000]  # truncate to fit model limits
-                }
-            ]
-        )
+        # Request summary from OpenAI with model fallback
+        messages = [
+            {
+                "role": "system",
+                "content": "You are a contract lawyer assistant. Extract important details from the provided contract, including parties, title info, mortgages, zoning, rates, insurance, notices, and any missing documents."
+            },
+            {
+                "role": "user",
+                "content": content[:12000]
+            }
+        ]
 
+        models_to_try = ["gpt-4", "gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"]
+        response = None
+        last_exception = None
+
+        for model_name in models_to_try:
+            try:
+                response = client.chat.completions.create(
+                    model=model_name,
+                    messages=messages
+                )
+                # success
+                break
+            except Exception as e:
+                # keep the last exception for error reporting and continue trying fallbacks
+                last_exception = e
+
+        if response is None:
+            # No model worked; return a 502 with the last OpenAI error message for debugging
+            raise HTTPException(status_code=502, detail=f"OpenAI model error: {str(last_exception)}")
+
+        # Extract summary text from successful response
         summary = response.choices[0].message.content
+
         return {"summary": summary}
 
     except Exception as e:
