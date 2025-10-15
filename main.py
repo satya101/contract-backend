@@ -6,18 +6,20 @@ import docx
 import fitz  # PyMuPDF
 from dotenv import load_dotenv
 
-# Load env vars
+# Load environment variables
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not OPENAI_API_KEY:
     raise ValueError("Missing OPENAI_API_KEY in .env")
 
+# Initialize OpenAI client
 client = OpenAI(api_key=OPENAI_API_KEY)
 
+# Initialize FastAPI app
 app = FastAPI()
 
-# CORS settings
+# Set up CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,35 +28,40 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def extract_text_from_pdf(file_bytes):
-    doc = fitz.open(stream=file_bytes, filetype="pdf")
-    text = ""
-    for page in doc:
-        text += page.get_text()
-    return text
+@app.get("/")
+def read_root():
+    return {"message": "Contract review backend is live"}
 
-def extract_text_from_docx(file):
-    doc = docx.Document(file)
+def extract_text_from_pdf(file_bytes: bytes) -> str:
+    """Extract text from a PDF file."""
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    return "\n".join([page.get_text() for page in doc])
+
+def extract_text_from_docx(file_path: str) -> str:
+    """Extract text from a DOCX file."""
+    doc = docx.Document(file_path)
     return "\n".join([para.text for para in doc.paragraphs])
 
 @app.post("/upload")
 async def upload_contract(file: UploadFile = File(...)):
+    """Endpoint to upload a contract and receive a summary."""
     try:
         file_bytes = await file.read()
 
         if file.filename.endswith(".pdf"):
             content = extract_text_from_pdf(file_bytes)
         elif file.filename.endswith(".docx"):
-            with open("temp.docx", "wb") as f:
+            temp_path = "temp.docx"
+            with open(temp_path, "wb") as f:
                 f.write(file_bytes)
-            content = extract_text_from_docx("temp.docx")
+            content = extract_text_from_docx(temp_path)
         else:
             raise HTTPException(status_code=400, detail="Unsupported file format")
 
         if not content.strip():
-            raise HTTPException(status_code=400, detail="No text extracted")
+            raise HTTPException(status_code=400, detail="No text extracted from file")
 
-        # Send to OpenAI
+        # Request summary from OpenAI
         response = client.chat.completions.create(
             model="gpt-4-turbo",
             messages=[
@@ -64,7 +71,7 @@ async def upload_contract(file: UploadFile = File(...)):
                 },
                 {
                     "role": "user",
-                    "content": content[:12000]  # keep within context limits
+                    "content": content[:12000]  # truncate to fit model limits
                 }
             ]
         )
