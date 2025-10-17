@@ -59,22 +59,39 @@ MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 # ----------------------------------------------------------------------------
 
 def extract_pdf_with_pages(path: str, ocr: bool = True) -> List[Dict[str, Any]]:
-    """Extract page-wise text from a PDF. If page text is empty and OCR is enabled & available,
-    rasterize and run Tesseract.
-    Returns: [{"page": int, "text": str}, ...]
-    """
     doc = fitz.open(path)
     pages: List[Dict[str, Any]] = []
     for i, page in enumerate(doc):
         text = page.get_text("text") or ""
-        if not text.strip() and ocr and _HAS_TESSERACT:
-            try:
-                pix = page.get_pixmap(dpi=300)
-                img = Image.open(io.BytesIO(pix.tobytes("png")))
-                text = pytesseract.image_to_string(img)
-            except Exception:
-                # Leave as empty if OCR fails
-                text = text or ""
+        if not text.strip() and ocr:
+            if _HAS_TESSERACT:
+                try:
+                    pix = page.get_pixmap(dpi=300)
+                    img = Image.open(io.BytesIO(pix.tobytes("png")))
+                    text = pytesseract.image_to_string(img)
+                except Exception:
+                    text = text or ""
+            else:
+                # Vision OCR fallback via OpenAI (no Tesseract needed)
+                try:
+                    pix = page.get_pixmap(dpi=240)
+                    import base64
+                    b64 = base64.b64encode(pix.tobytes("png")).decode("utf-8")
+                    vision_prompt = "Extract all readable text on this page. Return plain text only."
+                    resp = client.chat.completions.create(
+                        model=os.getenv("OPENAI_VISION_MODEL", "gpt-4o-mini"),
+                        messages=[{
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": vision_prompt},
+                                {"type": "input_image", "image_url": f"data:image/png;base64,{b64}"}
+                            ],
+                        }],
+                        temperature=0.0,
+                    )
+                    text = resp.choices[0].message.content or ""
+                except Exception:
+                    text = text or ""
         pages.append({"page": i + 1, "text": text})
     return pages
 
