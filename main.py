@@ -1,177 +1,417 @@
-
-# === Added integrations: email share & ask ===
 import os
+import io
+import json
 import smtplib
+import tempfile
 from email.message import EmailMessage
-from pydantic import BaseModel
-from fastapi import HTTPException
-try:
-    from openai import OpenAI
-except Exception:
-    OpenAI = None
+from typing import List, Dict, Any, Optional
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+# --- OpenAI ---
 from openai import OpenAI
-import os
-import docx
+
+# --- Document tooling ---
 import fitz  # PyMuPDF
-from dotenv import load_dotenv
+from docx import Document
 
-# Load environment variables
-load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# OCR (optional). If tesseract binary isn't present, we disable OCR gracefully.
+try:
+    import pytesseract  # type: ignore
+    from PIL import Image  # type: ignore
+    _HAS_TESSERACT = True
+except Exception:
+    _HAS_TESSERACT = False
 
-if not OPENAI_API_KEY:
-    raise ValueError("Missing OPENAI_API_KEY in .env")
+# ----------------------------------------------------------------------------
+# App & CORS
+# ----------------------------------------------------------------------------
+app = FastAPI(title="Contract Backend (Section 32)")
 
-# Initialize OpenAI client
-client = OpenAI(api_key=OPENAI_API_KEY)
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN")  # e.g. https://contractdashboardfinal.netlify.app
+if FRONTEND_ORIGIN:
+    allow_origins = [FRONTEND_ORIGIN]
+else:
+    # permissive for development; tighten in prod
+    allow_origins = ["*"]
 
-# Initialize FastAPI app
-app = FastAPI()
-
-# Set up CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-@app.get("/")
-def read_root():
-    return {"message": "Contract review backend is live"}
+# ----------------------------------------------------------------------------
+# OpenAI client
+# ----------------------------------------------------------------------------
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY is not set")
+client = OpenAI(api_key=OPENAI_API_KEY)
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-def extract_text_from_pdf(file_bytes: bytes) -> str:
-    """Extract text from a PDF file."""
-    doc = fitz.open(stream=file_bytes, filetype="pdf")
-    return "\n".join([page.get_text() for page in doc])
+# ----------------------------------------------------------------------------
+# Extraction utilities
+# ----------------------------------------------------------------------------
 
-def extract_text_from_docx(file_path: str) -> str:
-    """Extract text from a DOCX file."""
-    doc = docx.Document(file_path)
-    return "\n".join([para.text for para in doc.paragraphs])
-
-@app.post("/upload")
-async def upload_contract(file: UploadFile = File(...)):
-    """Endpoint to upload a contract and receive a summary."""
-    try:
-        file_bytes = await file.read()
-
-        if file.filename.endswith(".pdf"):
-            content = extract_text_from_pdf(file_bytes)
-        elif file.filename.endswith(".docx"):
-            temp_path = "temp.docx"
-            with open(temp_path, "wb") as f:
-                f.write(file_bytes)
-            content = extract_text_from_docx(temp_path)
-        else:
-            raise HTTPException(status_code=400, detail="Unsupported file format")
-
-        if not content.strip():
-            raise HTTPException(status_code=400, detail="No text extracted from file")
-
-        # Request summary from OpenAI with model fallback
-        messages = [
-            {
-                "role": "system",
-                "content": "You are an experienced contract lawyer assistant. Review this Section 32 Vendor Statement thoroughly from a residential property buyer’s perspective. Extract important details from the provided contract, including parties, title info, mortgages,easements, covenants, zoning, rates, insurance, notices, and any missing documents. Indicate any documentation discrepancies and suggest follow-up actions for the parties involved. Any hidden or ongoing financial liabilities such as unpaid taxes, council rates, or body corporate fees that may transfer to the buyer at settlement. Restrictions on the property’s title including easements, covenants, zoning, or planning overlays and how these might affect use, renovation, or resale potential. Validity and completeness of building permits, owner-builder insurance, occupancy certificates, and any environmental risks like contamination or flood zones. Summarize all key risks under legal, financial, zoning, and property condition categories with risk levels and practical actions a buyer should take before signing, such as obtaining further certificates or legal advice."
-            },
-            {
-                "role": "user",
-                "content": content[:12000]
-            }
-        ]
-
-        models_to_try = ["gpt-4", "gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"]
-        response = None
-        last_exception = None
-
-        for model_name in models_to_try:
+def extract_pdf_with_pages(path: str, ocr: bool = True) -> List[Dict[str, Any]]:
+    """Extract page-wise text from a PDF. If page text is empty and OCR is enabled & available,
+    rasterize and run Tesseract.
+    Returns: [{"page": int, "text": str}, ...]
+    """
+    doc = fitz.open(path)
+    pages: List[Dict[str, Any]] = []
+    for i, page in enumerate(doc):
+        text = page.get_text("text") or ""
+        if not text.strip() and ocr and _HAS_TESSERACT:
             try:
-                response = client.chat.completions.create(
-                    model=model_name,
-                    messages=messages
-                )
-                # success
-                break
-            except Exception as e:
-                # keep the last exception for error reporting and continue trying fallbacks
-                last_exception = e
-
-        if response is None:
-            # No model worked; return a 502 with the last OpenAI error message for debugging
-            raise HTTPException(status_code=502, detail=f"OpenAI model error: {str(last_exception)}")
-
-        # Extract summary text from successful response
-        summary = response.choices[0].message.content
-
-        return {"summary": summary}
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+                pix = page.get_pixmap(dpi=300)
+                img = Image.open(io.BytesIO(pix.tobytes("png")))
+                text = pytesseract.image_to_string(img)
+            except Exception:
+                # Leave as empty if OCR fails
+                text = text or ""
+        pages.append({"page": i + 1, "text": text})
+    return pages
 
 
+def extract_docx_with_pages(path: str) -> List[Dict[str, Any]]:
+    """DOCX has no true pagination; treat whole doc as page 1."""
+    d = Document(path)
+    text = "\n".join(p.text for p in d.paragraphs)
+    return [{"page": 1, "text": text}]
 
-class ShareEmailRequest(BaseModel):
+
+def chunk_pages(pages: List[Dict[str, Any]], max_chars: int = 8000) -> List[Dict[str, Any]]:
+    """Group page texts into chunks of ~max_chars, carrying page provenance."""
+    chunks: List[Dict[str, Any]] = []
+    buff, buff_pages = "", []
+    for p in pages:
+        header = f"[[PAGE {p['page']}]]\n"
+        candidate = header + (p.get("text") or "") + "\n\n"
+        if len(buff) + len(candidate) > max_chars and buff:
+            chunks.append({"text": buff, "pages": buff_pages[:]})
+            buff, buff_pages = "", []
+        buff += candidate
+        buff_pages.append(p["page"])
+    if buff:
+        chunks.append({"text": buff, "pages": buff_pages})
+    return chunks
+
+# ----------------------------------------------------------------------------
+# Schema & instructions
+# ----------------------------------------------------------------------------
+SECTION32_SCHEMA: Dict[str, Any] = {
+  "type": "object",
+  "properties": {
+    "title": {
+      "type": "object",
+      "properties": {
+        "owner_names": {"type": "array", "items": {"type": "string"}},
+        "volume_folio": {"type": "string"},
+        "plan_lot": {"type": "string"},
+        "encumbrances": {"type": "array", "items": {"type": "string"}},
+        "supporting_doc_present": {"type": "boolean"},
+        "page_refs": {"type": "array", "items": {"type": "integer"}}
+      },
+      "required": ["supporting_doc_present", "page_refs"]
+    },
+    "mortgages": {
+      "type": "object",
+      "properties": {
+        "mortgagees": {"type": "array", "items": {"type": "string"}},
+        "discharge_required": {"type": "boolean"},
+        "supporting_doc_present": {"type": "boolean"},
+        "page_refs": {"type": "array", "items": {"type": "integer"}}
+      },
+      "required": ["supporting_doc_present", "page_refs"]
+    },
+    "planning_zoning": {
+      "type": "object",
+      "properties": {
+        "zone": {"type": "string"},
+        "overlays": {"type": "array", "items": {"type": "string"}},
+        "certificate_date": {"type": "string"},
+        "supporting_doc_present": {"type": "boolean"},
+        "page_refs": {"type": "array", "items": {"type": "integer"}}
+      },
+      "required": ["supporting_doc_present", "page_refs"]
+    },
+    "rates_outgoings": {
+      "type": "object",
+      "properties": {
+        "council": {"type": "string"},
+        "annual_amount": {"type": "string"},
+        "owners_corp": {"type": "string"},
+        "supporting_doc_present": {"type": "boolean"},
+        "page_refs": {"type": "array", "items": {"type": "integer"}}
+      },
+      "required": ["supporting_doc_present", "page_refs"]
+    },
+    "insurance": {
+      "type": "object",
+      "properties": {
+        "policy_number": {"type": "string"},
+        "insurer": {"type": "string"},
+        "valid_to": {"type": "string"},
+        "supporting_doc_present": {"type": "boolean"},
+        "page_refs": {"type": "array", "items": {"type": "integer"}}
+      },
+      "required": ["supporting_doc_present", "page_refs"]
+    },
+    "building_permits": {
+      "type": "object",
+      "properties": {
+        "permits": {"type": "array", "items": {"type": "string"}},
+        "owner_builder": {"type": "boolean"},
+        "warranty_insurance": {"type": "string"},
+        "supporting_doc_present": {"type": "boolean"},
+        "page_refs": {"type": "array", "items": {"type": "integer"}}
+      },
+      "required": ["supporting_doc_present", "page_refs"]
+    },
+    "notices": {
+      "type": "object",
+      "properties": {
+        "adverse_notices": {"type": "array", "items": {"type": "string"}},
+        "supporting_doc_present": {"type": "boolean"},
+        "page_refs": {"type": "array", "items": {"type": "integer"}}
+      },
+      "required": ["supporting_doc_present", "page_refs"]
+    },
+    "special_conditions": {
+      "type": "object",
+      "properties": {
+        "items": {"type": "array", "items": {"type": "string"}},
+        "caveats": {"type": "array", "items": {"type": "string"}},
+        "supporting_doc_present": {"type": "boolean"},
+        "page_refs": {"type": "array", "items": {"type": "integer"}}
+      },
+      "required": ["supporting_doc_present", "page_refs"]
+    },
+    "missing_or_unclear": {
+      "type": "array",
+      "items": {"type": "string"}
+    }
+  },
+  "required": [
+    "title","mortgages","planning_zoning","rates_outgoings",
+    "insurance","building_permits","notices","special_conditions","missing_or_unclear"
+  ]
+}
+
+EXTRACTION_INSTRUCTIONS = """
+You are extracting a Victorian Section 32 (Vendor Statement) summary.
+
+RULES:
+- Only return valid JSON matching the provided schema.
+- Use the exact field names.
+- For each section, set supporting_doc_present true/false based on evidence.
+- Always include page_refs (list of integers).
+- If a field isn't present, leave it empty but still include the key; also add a human-readable note to `missing_or_unclear`.
+- Never invent data; if uncertain, state so in `missing_or_unclear`.
+
+Checklist to look for:
+- Title (volume/folio, plan/lot, encumbrances/easements, caveats)
+- Mortgages/charges & discharge
+- Planning/Zoning certificate (zone/overlays, date, authority)
+- Rates & outgoings (council, owners corp/strata)
+- Insurance (building policy; owner-builder warranty if applicable)
+- Building permits (numbers/dates, owner-builder status)
+- Notices/adverse matters (from council or authorities)
+- Special conditions & caveats (contract specials, restrictions)
+"""
+
+# ----------------------------------------------------------------------------
+# Model helpers
+# ----------------------------------------------------------------------------
+
+def _extract_json(text: str) -> Dict[str, Any]:
+    text = (text or "").strip()
+    s = text.find("{")
+    e = text.rfind("}")
+    snippet = text[s:e+1] if s != -1 and e != -1 and e > s else text
+    return json.loads(snippet)
+
+
+def call_model(chunk_text: str) -> Dict[str, Any]:
+    prompt = f"""{EXTRACTION_INSTRUCTIONS}
+
+SOURCE:
+{chunk_text}
+
+Return JSON ONLY, matching this JSON schema loosely (names/types):
+{json.dumps(SECTION32_SCHEMA, indent=2)}
+"""
+    resp = client.chat.completions.create(
+        model=MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+    )
+    txt = resp.choices[0].message.content or "{}"
+    return _extract_json(txt)
+
+
+def merge_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+
+    def union_list(a, b):
+        if isinstance(a, list) and isinstance(b, list):
+            return sorted(list({x for x in (a + b) if x not in (None, "")}))
+        if isinstance(a, list):
+            return a
+        if isinstance(b, list):
+            return b
+        return []
+
+    wanted = [
+        "title","mortgages","planning_zoning","rates_outgoings",
+        "insurance","building_permits","notices","special_conditions"
+    ]
+
+    for r in results:
+        for key, val in r.items():
+            if key in wanted and isinstance(val, dict):
+                out.setdefault(key, {})
+                cur = out[key]
+                for k, v in val.items():
+                    if k == "page_refs" and isinstance(v, list):
+                        cur.setdefault("page_refs", [])
+                        cur["page_refs"] = sorted(list(set(cur["page_refs"] + v)))
+                    elif k == "supporting_doc_present":
+                        cur["supporting_doc_present"] = bool(v) or cur.get("supporting_doc_present", False)
+                    elif isinstance(v, list):
+                        cur[k] = union_list(cur.get(k, []), v)
+                    else:
+                        cur[k] = v or cur.get(k)
+            elif key == "missing_or_unclear" and isinstance(val, list):
+                out.setdefault("missing_or_unclear", [])
+                out["missing_or_unclear"] = union_list(out["missing_or_unclear"], val)
+
+    for req in wanted:
+        out.setdefault(req, {})
+        out[req].setdefault("supporting_doc_present", False)
+        out[req].setdefault("page_refs", [])
+
+    out.setdefault("missing_or_unclear", [])
+    return out
+
+# ----------------------------------------------------------------------------
+# Pydantic models for auxiliary endpoints
+# ----------------------------------------------------------------------------
+class AskPayload(BaseModel):
+    question: str
+    context: Optional[str] = None
+
+class EmailPayload(BaseModel):
     to: str
     subject: str
     body: str
 
+# ----------------------------------------------------------------------------
+# Routes
+# ----------------------------------------------------------------------------
+@app.get("/")
+async def root():
+    return {"status": "ok", "model": MODEL}
+
+
+@app.post("/upload")
+async def upload(file: UploadFile = File(...)):
+    # Decide OCR based on env & availability
+    ocr_enabled = os.getenv("ENABLE_OCR", "false").lower() == "true" and _HAS_TESSERACT
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{file.filename}") as tmp:
+        tmp.write(await file.read())
+        tmp_path = tmp.name
+
+    # Extract
+    if file.filename.lower().endswith(".pdf"):
+        pages = extract_pdf_with_pages(tmp_path, ocr=ocr_enabled)
+    elif file.filename.lower().endswith(".docx"):
+        pages = extract_docx_with_pages(tmp_path)
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported file type. Please upload PDF or DOCX.")
+
+    if not pages or all(not (p.get("text") or "").strip() for p in pages):
+        raise HTTPException(status_code=422, detail="No text could be extracted. Enable OCR or provide a text-based file.")
+
+    # Chunk and extract
+    chunks = chunk_pages(pages, max_chars=8000)
+    results: List[Dict[str, Any]] = []
+    for ch in chunks:
+        chunk_with_pages = f"(Pages: {ch['pages']})\n" + ch["text"]
+        try:
+            js = call_model(chunk_with_pages)
+            # ensure page refs present
+            for sect in ["title","mortgages","planning_zoning","rates_outgoings","insurance","building_permits","notices","special_conditions"]:
+                if sect in js and isinstance(js[sect], dict):
+                    prs = set(js[sect].get("page_refs", [])) | set(ch["pages"])
+                    js[sect]["page_refs"] = sorted(list(prs))
+            results.append(js)
+        except Exception as e:
+            results.append({"missing_or_unclear": [f"Chunk failed: {e}"]})
+
+    summary = merge_results(results)
+    return {"summary": summary, "pages": [p["page"] for p in pages], "file": file.filename}
+
+
+@app.post("/ask")
+async def ask(payload: AskPayload):
+    if not payload.question or not payload.question.strip():
+        raise HTTPException(status_code=400, detail="Question is required")
+
+    context_snippet = (payload.context or "").strip()
+    user_prompt = (
+        "You are a contract review assistant. Answer concisely and cite any specific sections/pages if you can.\n\n"
+        f"CONTEXT (may be truncated):\n{context_snippet}\n\n"
+        f"QUESTION: {payload.question}\n"
+    )
+
+    resp = client.chat.completions.create(
+        model=MODEL,
+        messages=[{"role": "user", "content": user_prompt}],
+        temperature=0.2,
+    )
+    answer = resp.choices[0].message.content or ""
+    return {"answer": answer}
+
+
 @app.post("/share-email")
-def share_email(req: ShareEmailRequest):
-    smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
+async def share_email(payload: EmailPayload):
+    """Send summary via SMTP if credentials are present; otherwise tell the client to use mailto fallback."""
+    smtp_host = os.getenv("SMTP_HOST")
     smtp_port = int(os.getenv("SMTP_PORT", "587"))
     smtp_user = os.getenv("SMTP_USER")
     smtp_pass = os.getenv("SMTP_PASS")
-    if not (smtp_user and smtp_pass):
-        raise HTTPException(status_code=500, detail="SMTP not configured on server")
+    smtp_from = os.getenv("SMTP_FROM") or smtp_user
+
+    if not (smtp_host and smtp_user and smtp_pass and smtp_from):
+        # No SMTP configured; front-end should fallback to mailto
+        return {"sent": False, "note": "SMTP not configured; use client mailto fallback."}
 
     msg = EmailMessage()
-    msg["From"] = smtp_user
-    msg["To"] = req.to
-    msg["Subject"] = req.subject
-    msg.set_content(req.body)
-
-    with smtplib.SMTP(smtp_host, smtp_port) as s:
-        s.starttls()
-        s.login(smtp_user, smtp_pass)
-        s.send_message(msg)
-
-    return {"status": "sent"}
-
-
-
-class AskRequest(BaseModel):
-    question: str
-    context: str
-
-@app.post("/ask")
-def ask(req: AskRequest):
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY not set")
-    if OpenAI is None:
-        raise HTTPException(status_code=500, detail="openai sdk not installed on server")
-
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-    client = OpenAI(api_key=api_key)
-
-    prompt = (
-        "You are a contract assistant. Answer briefly and concretely.\n\n"
-        "CONTEXT (summary JSON or text):\n" + req.context + "\n\n"
-        "QUESTION: " + req.question
-    )
+    msg["From"] = smtp_from
+    msg["To"] = payload.to
+    msg["Subject"] = payload.subject
+    msg.set_content(payload.body)
 
     try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-        )
-        answer = resp.choices[0].message.content
-        return {"answer": answer}
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
+            server.starttls()
+            server.login(smtp_user, smtp_pass)
+            server.send_message(msg)
+        return {"sent": True}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Email send failed: {e}")
+
+
+# Local dev entrypoint
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", "8080"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
