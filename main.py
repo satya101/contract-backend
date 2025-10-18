@@ -5,6 +5,8 @@ import smtplib
 import tempfile
 from email.message import EmailMessage
 from typing import List, Dict, Any, Optional
+# --- Feedback route ---
+from pydantic import BaseModel
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -44,7 +46,22 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+class FeedbackIn(BaseModel):
+    rating: int
+    message: str
+    email: str | None = None
+    docName: str | None = None
 
+@app.post("/feedback")
+async def feedback(item: FeedbackIn):
+    # Minimal: log it. Replace with DB insert if you have Postgres.
+    try:
+        print("FEEDBACK:", item.model_dump())
+        # Example DB insert (pseudo):
+        # cur.execute("INSERT INTO feedback (rating,message,email,doc_name) VALUES (%s,%s,%s,%s)", (item.rating,item.message,item.email,item.docName))
+        return {"ok": True}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"detail": f"Could not record feedback: {e}"})
 # ----------------------------------------------------------------------------
 # OpenAI client
 # ----------------------------------------------------------------------------
